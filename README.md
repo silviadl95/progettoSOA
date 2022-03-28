@@ -3,15 +3,21 @@
 Per compilare:
 
 nella cartella progettoSOA
+
 make
+
 sudo insmod driver.ko
+
 dmesg (per conoscere il major assegnato)
+
 sudo rmmod driver.ko (dopo l'utilizzo)
 
 Per testare:
 
 nella cartella progettoSOA/user
+
 make
+
 sudo ./user /dev/my-new-dev Major Minor
 
 ---------------------------------------------------
