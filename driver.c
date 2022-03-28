@@ -121,6 +121,7 @@ static long dev_ioctl(struct file *filp, unsigned command, unsigned long param) 
             printk(KERN_ERR "%s: [ioctl] invalid param for IOCTL_ENABLE_DEVICE\n", MODNAME);
             return -EINVAL;
          }
+         break;
       //comando per disabilitare un device file
       case IOCTL_DISABLE_DEVICE:
          //controllo del minor passato
@@ -131,6 +132,7 @@ static long dev_ioctl(struct file *filp, unsigned command, unsigned long param) 
             printk(KERN_ERR "%s: [ioctl] invalid param for IOCTL_DISABLE_DEVICE\n", MODNAME);
             return -EINVAL;
          }
+         break;
       default:
          printk(KERN_ERR "%s: [ioctl] invalid command code %u\n", MODNAME, command);
          return -ENOTTY;
