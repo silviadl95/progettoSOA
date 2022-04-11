@@ -67,8 +67,11 @@ static int Major;
 //con indice [0] si accedono agli attributi del flusso con alta priorità
 //con indice [1] si accedono agli attributi del flusso con bassa priorità
 typedef struct _object_state {
-	struct mutex operation_synchronizer[2]; //un mutex per flusso
-	loff_t valid_bytes[2]; //byte validi per ogni flusso
+	struct mutex data_access[2];
+	struct mutex next_to_access[2];
+	struct mutex first_access[2];
+	loff_t valid_bytes[2]; //numero di byte che sono effettivamente scritti sul device file
+	loff_t reserved_bytes[2]; //numero di "prenotati" per le scritture differite  
 	char *stream_content[2]; //buffer per le scritture/letture sul device
 	int priority; //vale 1 se è priorità bassa, 0 priorità alta, vale 1 di default.
 	int blocking_read; //vale 1 (ON) se è bloccante, 0 (OFF) altrimenti, vale 0FF di default
@@ -76,6 +79,8 @@ typedef struct _object_state {
 	int timeout; //vale 1 (ON) se è attivo, 0 (OFF) altrimenti, vale OFF di default
 	int jiffies; //tempo trascorso nella waitqueue, vale 500 (5 secondi) di default
 } object_state;
+
+
 
 object_state objects[MINORS];
 
@@ -86,8 +91,7 @@ typedef struct _elem {
 	char *mod; //vale "r" se deve eseguire una read o "w" una write
 	int timeout; //vale 1 se si sveglia dopo un timeout o 0 se si sveglia per un awake
 	int awake;
-	int bytes; //il numero di bytes letti da una scrittura asincrona 
-			   //se il thread nella waitqueue non è in attesa di una scrittura asincrona allora bytes vale -1
+	int bytes; //il numero di bytes da leggere/scrivere
 	struct _elem *next;
 } elem;
 
@@ -99,7 +103,6 @@ spinlock_t queue_lock[MINORS][2];
 //struttura per gestire il work deferred
 typedef struct _packed_work{
 	void *buffer;
-	int pid; //il pid del thread che ha chiamato la scrittura asincrona	
 	int minor;
 	char *buff; 
 	size_t len;
@@ -113,8 +116,8 @@ typedef struct _packed_work{
 
 char *read_mod = "read_mod";
 char *write_mod = "write_mod";
-long goto_sleep(int minor, int priority, int jiffies, char *mod);
-long awake(int minor, int priority, char *mod, int bytes, int pid);
+long goto_sleep(int minor, int priority, int jiffies, char *mod, int bytes);
+long awake(int minor, int priority, int bytes);
 void deferred_write(struct work_struct *data);
 
 static int dev_open(struct inode *, struct file *);
