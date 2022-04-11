@@ -145,14 +145,87 @@ static long dev_ioctl(struct file *filp, unsigned command, unsigned long param) 
 static ssize_t dev_write(struct file *filp, const char *buff, size_t len, loff_t *off) {
 
    int minor = get_minor(filp);
-   int ret;
+   int priority;
+   int firstTry = 1; //è uguale a 1 durante il primo tentativo di accedere alla risorsa
    object_state *the_object;
-
    the_object = objects + minor;
    printk("%s: somebody called a write on dev with [major,minor] number [%d,%d] and priority %d\n", MODNAME, get_major(filp), get_minor(filp), the_object->priority);
 
+   //prende i mutex, essendo il primo tentativo è meno prioritario rispetto a un thread che è già passato nella waitqueue
+   mutex_lock(&(the_object->first_access[the_object->priority]));
+   mutex_lock(&(the_object->next_to_access[the_object->priority]));
+   mutex_lock(&(the_object->data_access[the_object->priority]));
+   mutex_unlock(&(the_object->next_to_access[the_object->priority]));
+
+   priority = the_object->priority;
+   //le scritture vengono eseguite in append
+   *off = the_object->valid_bytes[priority];
+
+   //se la scrittura è bloccante deve andare nella waitqueue
+   //finché non c'è abbastanza spazio nel buffer
+   if (the_object->blocking_write) {
+      //se la scrittura è più grande del buffer stesso non sarà mai possibile eseguirla
+      if (len > OBJECT_MAX_SIZE) {
+         printk(KERN_ERR "%s: len too large for a blocking operation %d\n", MODNAME, minor);
+         mutex_unlock(&(the_object->data_access[the_object->priority]));
+         mutex_unlock(&(the_object->first_access[the_object->priority]));
+         return -EINVAL;
+      }
+
+      //se il thread deve andare per la prima volta nella waitqueue rilascia il mutex 
+      //dedicato al primo accesso e aggiorna la variabile firstTry
+      if ((OBJECT_MAX_SIZE - (*off + the_object->reserved_bytes[priority])) < len) {
+         mutex_unlock(&(the_object->first_access[the_object->priority]));
+         firstTry = 0;
+
+      }
+
+      while ((OBJECT_MAX_SIZE - (*off + the_object->reserved_bytes[priority])) < len) {
+         //rilascia il mutex e si sposta nella waitqueue
+         mutex_unlock(&(the_object->data_access[the_object->priority]));
+         if (the_object->timeout == ON) {
+            goto_sleep(minor, priority, the_object->jiffies, write_mod, len);
+         } else {
+            goto_sleep(minor, priority, 0, write_mod, len);
+         }
+         mutex_lock(&(the_object->next_to_access[the_object->priority]));
+         mutex_lock(&(the_object->data_access[the_object->priority]));
+         mutex_unlock(&(the_object->next_to_access[the_object->priority]));
+         *off = the_object->valid_bytes[priority];
+
+      }
+   }
+   else {
+      //se la scrittura non è bloccante len è imposto al massimo di byte che posso scrivere
+      if ((OBJECT_MAX_SIZE - (*off + the_object->reserved_bytes[priority])) < len) len = OBJECT_MAX_SIZE - (*off + the_object->reserved_bytes[priority]);
+   }
+
+   
+   //se il flusso su cui scrivere è quello a priorità alta si esegue la scrittura sincrona
+   if (priority == HIGH_PRIORITY) {
+      printk("synchronous write operation with priority %d --> %s\n", priority, buff);
+      copy_from_user(&(the_object->stream_content[priority][*off]), buff, len);
+      *off += len;
+      the_object->valid_bytes[priority] = *off;
+      bytes_high_priority[minor] = *off; 
+
+      //controlla se ci sono dei thread nella waitqueue che devono leggere o scrivere e in caso ne sveglia uno
+      if ((waiting_threads_high_priority[minor] > 0)) {
+         awake(minor, priority, the_object->valid_bytes[HIGH_PRIORITY]);
+      }
+
+   } else {
+      the_object->reserved_bytes[priority] += len;
+   }
+
+   //rilascio dei mutex
+   mutex_unlock(&(the_object->data_access[the_object->priority]));
+   if (firstTry == 1) {
+      mutex_unlock(&(the_object->first_access[the_object->priority]));
+   }
+
    //se il flusso su cui scrivere è quello a priorità bassa si esegue la scrittura asincrona
-   if (the_object->priority == LOW_PRIORITY) {
+   if (priority == LOW_PRIORITY) {
 
       //allocazione del task
       packed_work *the_task;
@@ -163,9 +236,6 @@ static ssize_t dev_write(struct file *filp, const char *buff, size_t len, loff_t
          return -1;
       }
 
-      the_task->buffer = the_task;
-
-      //allocazione del buffer da passare come argomento per la deferred write
       the_task->buff = kzalloc(sizeof(char)*len, GFP_ATOMIC);
       if (the_task->buff == NULL) {
          printk(KERN_ERR "%s: buffer allocation failure\n", MODNAME);
@@ -174,89 +244,28 @@ static ssize_t dev_write(struct file *filp, const char *buff, size_t len, loff_t
       }
       
       //copia della scrittura sul buffer
-      ret = copy_from_user(&(the_task->buff[0]), buff, len);
-
-      the_task->len = len-ret;
+      copy_from_user(&(the_task->buff[0]), buff, len);
+      
+      the_task->buffer = the_task;
+      the_task->len = len;
       the_task->minor = minor;
-      the_task->pid = current->pid;
 
       printk("%s: work buffer allocation success - address is %p\n", MODNAME, the_task);
 
       INIT_WORK(&(the_task->the_work), (void*)deferred_write);
       schedule_work(&the_task->the_work);
 
-      ret = goto_sleep(minor, LOW_PRIORITY, 0, NULL);
-
-      //controlla se ci sono dei thread nella waitqueue che devono leggere o scrivere e in caso ne sveglia uno
-      awake(minor, LOW_PRIORITY, read_mod, -1, 0);
-      awake(minor, LOW_PRIORITY, write_mod, -1, 0);  
-
-      return ret;
    }
 
-   //scrittura sul flusso ad alta priorità sincrona
-   //prende il mutex
-   mutex_lock(&(the_object->operation_synchronizer[HIGH_PRIORITY]));
 
-   //le scritture vengono eseguite in append
-   *off = the_object->valid_bytes[HIGH_PRIORITY];
-
-   //check sul valore di off
-   if (*off > OBJECT_MAX_SIZE) {
-      printk(KERN_ERR "%s: offset too large %d\n", MODNAME, minor);
-      mutex_unlock(&(the_object->operation_synchronizer[HIGH_PRIORITY]));
-      return -ENOSPC;
-   } 
-
-   //se la scrittura è bloccante deve andare nella waitqueue
-   //finché non c'è abbastanza spazio nel buffer
-   if (the_object->blocking_write) {
-      //se la scrittura è più grande del buffer stesso non sarà mai possibile eseguirla
-      if (len > OBJECT_MAX_SIZE) {
-         printk(KERN_ERR "%s: len too large for a blocking operation %d\n", MODNAME, minor);
-         mutex_unlock(&(the_object->operation_synchronizer[the_object->priority]));
-         return -EINVAL;
-      }
-
-      while ((OBJECT_MAX_SIZE - *off) < len) {
-         //rilascia il mutex e si sposta nella waitqueue
-         mutex_unlock(&(the_object->operation_synchronizer[the_object->priority]));
-         if (the_object->timeout == ON) {
-            goto_sleep(minor, the_object->priority, the_object->jiffies, write_mod);
-         } else {
-            goto_sleep(minor, the_object->priority, 0, write_mod);
-         }
-         mutex_lock(&(the_object->operation_synchronizer[the_object->priority]));
-         *off = the_object->valid_bytes[the_object->priority];
-
-      }
-   }
-   else {
-      //se la scrittura non è bloccante len è imposto al massimo di byte che posso scrivere
-      if ((OBJECT_MAX_SIZE - *off) < len) len = OBJECT_MAX_SIZE - *off;
-   }
-
-   printk("synchronous write operation with priority %d --> %s\n", HIGH_PRIORITY, buff);
-   ret = copy_from_user(&(the_object->stream_content[HIGH_PRIORITY][*off]), buff, len);
-
-   //update dei bytes scritti nel buffer e dei module param
-   *off += (len - ret);
-   bytes_high_priority[minor] = *off;
-   the_object->valid_bytes[HIGH_PRIORITY] = *off;
-
-   //rilascio del mutex
-   mutex_unlock(&(the_object->operation_synchronizer[the_object->priority]));
-   //controlla se ci sono dei thread nella waitqueue che devono leggere o scrivere e in caso ne sveglia uno
-   awake(minor, HIGH_PRIORITY, read_mod, -1, 0);
-   awake(minor, HIGH_PRIORITY, write_mod, -1, 0);
-
-   return len - ret;
+   return len;
 }
 
 static ssize_t dev_read(struct file *filp, char *buff, size_t len, loff_t *off) {
 
    int minor = get_minor(filp);
-   int ret;
+   int ret, priority; //è uguale a 1 durante il primo tentativo di accedere alla risorsa
+   int firstTry = 1;
    char *copy = NULL;
    object_state *the_object;
 
@@ -267,21 +276,43 @@ static ssize_t dev_read(struct file *filp, char *buff, size_t len, loff_t *off) 
    //le letture sono effettuate sempre dall'inizio del file device
    *off = 0;
    
-   //prende il mutex
-   mutex_lock(&(the_object->operation_synchronizer[the_object->priority]));
+   //prende i mutex, essendo il primo tentativo è meno prioritario rispetto a un thread che è già passato nella waitqueue
+   mutex_lock(&(the_object->first_access[the_object->priority]));
+   mutex_lock(&(the_object->next_to_access[the_object->priority]));
+   mutex_lock(&(the_object->data_access[the_object->priority]));
 
+   mutex_unlock(&(the_object->next_to_access[the_object->priority]));   priority = the_object->priority;
+   
    //se la lettura è bloccante deve andare nella waitqueue
    //finché non ci sono abbastanza bytes nel buffer
    if (the_object->blocking_read) {
+
+      //se la lettura è più grande del buffer stesso non sarà mai possibile eseguirla
+      if (len > OBJECT_MAX_SIZE) {
+         printk(KERN_ERR "%s: len too large for a blocking operation %d\n", MODNAME, minor);
+         mutex_unlock(&(the_object->data_access[the_object->priority]));
+         mutex_unlock(&(the_object->first_access[the_object->priority]));
+         return -EINVAL;
+      }
+
+      //se il thread deve andare per la prima volta nella waitqueue rilascia il mutex 
+      //dedicato al primo accesso e aggiorna la variabile firstTry
+      if (the_object->valid_bytes[the_object->priority] < len) {
+         mutex_unlock(&(the_object->first_access[the_object->priority]));
+         firstTry = 0;
+
+      }
       while(the_object->valid_bytes[the_object->priority] < len) {
          //rilascia il mutex e va nella waitqueue
-         mutex_unlock(&(the_object->operation_synchronizer[the_object->priority]));
+         mutex_unlock(&(the_object->data_access[the_object->priority]));
          if (the_object->timeout == ON) {
-            goto_sleep(minor, the_object->priority, the_object->jiffies, read_mod);
+            goto_sleep(minor, the_object->priority, the_object->jiffies, read_mod, len);
          } else {
-            goto_sleep(minor, the_object->priority, 0, read_mod);
+            goto_sleep(minor, the_object->priority, 0, read_mod, len);
          }
-         mutex_lock(&(the_object->operation_synchronizer[the_object->priority]));
+         mutex_lock(&(the_object->next_to_access[the_object->priority]));
+         mutex_lock(&(the_object->data_access[the_object->priority]));
+         mutex_unlock(&(the_object->next_to_access[the_object->priority]));
       }
    }
    else {
@@ -308,11 +339,17 @@ static ssize_t dev_read(struct file *filp, char *buff, size_t len, loff_t *off) 
    if (the_object->priority == 0) bytes_high_priority[minor] = the_object->valid_bytes[the_object->priority];
    else bytes_low_priority[minor] = the_object->valid_bytes[the_object->priority];
 
-   //rilascio del mutex
-   mutex_unlock(&(the_object->operation_synchronizer[the_object->priority]));
+   
    //controlla se ci sono dei thread nella waitqueue che devono scrivere e in caso ne sveglia uno
-   awake(minor, the_object->priority, write_mod, -1, 0);
-   awake(minor, the_object->priority, read_mod, -1, 0);
+   if (((priority == HIGH_PRIORITY) && (waiting_threads_high_priority[minor] > 0)) || ((priority == LOW_PRIORITY) && (waiting_threads_low_priority[minor] > 0))) {
+      awake(minor, priority, the_object->valid_bytes[priority]);
+   }
+
+   //rilascio del mutex
+   mutex_unlock(&(the_object->data_access[the_object->priority]));
+   if (firstTry == 1) {
+      mutex_unlock(&(the_object->first_access[the_object->priority]));
+   }
 
 
    return len - ret;
@@ -320,14 +357,14 @@ static ssize_t dev_read(struct file *filp, char *buff, size_t len, loff_t *off) 
 }
 
 
-long goto_sleep(int minor, int priority, int jiffies, char *mod) {
+long goto_sleep(int minor, int priority, int jiffies, char *mod, int bytes) {
 
    volatile elem me;
    elem *aux;
 
    me.next = NULL;
    me.task = current;
-   me.bytes = 0;
+   me.bytes = bytes;
    me.pid  = current->pid;
    me.awake = OFF;
 
@@ -367,10 +404,8 @@ sleep:
    spin_unlock(& (queue_lock[minor][priority]));
 
    //aumenta i module param se il thread è in modalità bloccante
-   if (mod != NULL) {
-      if (priority == HIGH_PRIORITY) atomic_inc((atomic_t*)&waiting_threads_high_priority[minor]);
-      else atomic_inc((atomic_t*)&waiting_threads_low_priority[minor]);
-   }
+   if (priority == HIGH_PRIORITY) atomic_inc((atomic_t*)&waiting_threads_high_priority[minor]);
+   else atomic_inc((atomic_t*)&waiting_threads_low_priority[minor]);
    
    AUDIT
    printk("%s: thread %d actually going to sleep\n", FUNCTION, current->pid);
@@ -411,29 +446,27 @@ sleep:
    printk("%s: thread %d exiting sleep for a wakeup or signal\n", FUNCTION, current->pid);
 
    //decrementa i module param
-   if (mod != NULL) {
-      if (priority == HIGH_PRIORITY) atomic_dec((atomic_t*)&waiting_threads_high_priority[minor]);//a new sleeper 
-      else atomic_dec((atomic_t*)&waiting_threads_low_priority[minor]);
-   }
-
+   if (priority == HIGH_PRIORITY) atomic_dec((atomic_t*)&waiting_threads_high_priority[minor]);//a new sleeper 
+   else atomic_dec((atomic_t*)&waiting_threads_low_priority[minor]);
+   
    if(me.awake == OFF){
       AUDIT
       printk("%s: thread %d exiting sleep for signal\n",FUNCTION, current->pid);
       return -EINTR;
    }
 
-   return me.bytes;
+   return 0;
 
 }
 
-long awake(int minor, int priority, char *mod, int bytes, int pid) {
+long awake(int minor, int priority, int bytes) {
    
    struct task_struct *the_task;
    int its_pid = -1;
    elem *aux;
 
 
-   printk("%s: sys_awake called from thread %d with mod %s\n", FUNCTION, current->pid, mod);
+   printk("%s: sys_awake called from thread %d\n", FUNCTION, current->pid);
    
    aux = list[minor][priority];
    
@@ -446,24 +479,17 @@ long awake(int minor, int priority, char *mod, int bytes, int pid) {
       return -1;
    }
 
-   //sveglia il primo della lista che non sta aspettando un timeout e che deve eseguire l'operazione mod
+   //sveglia il primo della lista che non sta aspettando un timeout e per cui ci sono abbastanza byte (da leggere o da scrivere) sul device file
    for(; aux; ) {
       if(aux->next) {
-         if ((aux->next->timeout == OFF) && (aux->next->mod == mod) && (bytes == -1)) {
+         if ((aux->next->timeout == OFF) && (((aux->next->mod == read_mod) && (aux->next->bytes <= bytes)) || ((aux->next->mod == write_mod) && (aux->next->bytes <= OBJECT_MAX_SIZE-bytes)))) {
             the_task = aux->next->task;
             aux->next->awake = ON;
             its_pid = aux->next->pid;
             wake_up_process(the_task);
             break;
          }
-         else if (aux->next->pid == pid) {
-            the_task = aux->next->task;
-            aux->next->awake = ON;
-            its_pid = aux->next->pid;
-            aux->next->bytes = bytes;
-            wake_up_process(the_task);
-            break;
-         }
+        
       }
    aux = aux->next;
    }  
@@ -489,61 +515,32 @@ void deferred_write(struct work_struct *data) {
 
    the_object = objects + minor;
 
-   //prende il mutex
-   mutex_lock(& (the_object->operation_synchronizer[LOW_PRIORITY]));
+   //prende i mutex
+   mutex_lock(&(the_object->first_access[LOW_PRIORITY]));
+   mutex_lock(&(the_object->next_to_access[LOW_PRIORITY]));
+   mutex_lock(&(the_object->data_access[LOW_PRIORITY]));
+
+   mutex_unlock(&(the_object->next_to_access[LOW_PRIORITY]));
    
-   //check sul valore di off   
-   if (the_object->valid_bytes[LOW_PRIORITY] > OBJECT_MAX_SIZE) {
-      printk(KERN_ERR "%s: errore nella write offset %lld too large %d\n", MODNAME, the_object->valid_bytes[LOW_PRIORITY], minor);
-      mutex_unlock(&(the_object->operation_synchronizer[LOW_PRIORITY]));
-      awake(minor, LOW_PRIORITY, NULL, 0, container_of(data, packed_work, the_work)->pid);
-      return;
-   } 
-
-   //se la scrittura è bloccante deve andare nella waitqueue
-   //finché non c'è abbastanza spazio nel buffer
-   if (the_object->blocking_write) {
-      //se la scrittura è più grande del buffer stesso non sarà mai possibile eseguirla
-      if (len > OBJECT_MAX_SIZE) {
-         printk(KERN_ERR "%s: len too large for a blocking operation %d\n", MODNAME, minor);
-         mutex_unlock(& (the_object->operation_synchronizer[LOW_PRIORITY]));
-         awake(minor, LOW_PRIORITY, NULL, 0, container_of(data, packed_work, the_work)->pid);
-         return;
-      }
-      while ((OBJECT_MAX_SIZE - the_object->valid_bytes[LOW_PRIORITY]) < len) {
-         //rilascia il mutex e si sposta nella waitqueue
-         mutex_unlock(&(the_object->operation_synchronizer[LOW_PRIORITY]));
-         if (the_object->timeout == ON) {
-            goto_sleep(minor, LOW_PRIORITY, the_object->jiffies, write_mod);
-         } else {
-            goto_sleep(minor, LOW_PRIORITY, 0, write_mod);
-         }
-         mutex_lock(& (the_object->operation_synchronizer[LOW_PRIORITY]));
-      }
-   }
-   else {
-      //se la scrittura non è bloccante len è imposto al massimo di byte che posso scrivere
-         if((OBJECT_MAX_SIZE - the_object->valid_bytes[LOW_PRIORITY]) < len) len = OBJECT_MAX_SIZE - the_object->valid_bytes[LOW_PRIORITY];
-         
-   }
-
-   printk("asynchronous write operation with priority %d --> %s\n", LOW_PRIORITY, container_of(data, packed_work, the_work)->buff);
+   printk("asynchronous write operation with priority %d\n", LOW_PRIORITY);
+   
    //la strcpy è utilizza con due buffer entrambi nello spazio kernel
    strncpy(& (the_object->stream_content[LOW_PRIORITY][the_object->valid_bytes[LOW_PRIORITY]]), container_of(data, packed_work, the_work)->buff, len);
-
-   //update dei module param
-   the_object->valid_bytes[1] += (len);
-  
-   bytes_low_priority[minor] = the_object->valid_bytes[LOW_PRIORITY];
+   the_object->valid_bytes[LOW_PRIORITY] += len;   
+   bytes_low_priority[minor] += len; 
+   the_object->reserved_bytes[LOW_PRIORITY] -= len;
    
-   //rilascio del mutex
-   mutex_unlock(&(the_object->operation_synchronizer[LOW_PRIORITY]));   
-    
-   awake(minor, LOW_PRIORITY, NULL, len, container_of(data, packed_work, the_work)->pid);
+   //controlla se ci sono dei thread nella waitqueue che devono leggere o scrivere e in caso ne sveglia uno
+   if ((waiting_threads_low_priority[minor] > 0)) {
+      awake(minor, LOW_PRIORITY, the_object->valid_bytes[LOW_PRIORITY]);
+   }
 
+   //rilascio del mutex
+   mutex_unlock(&(the_object->data_access[LOW_PRIORITY]));
+   mutex_unlock(&(the_object->first_access[LOW_PRIORITY]));
 
    //libera la memoria utilizzata
-   kfree((void*)container_of(data, packed_work, the_work)->buff);   
+   kfree((void*)container_of(data,packed_work,the_work)->buff);   
    kfree((void*)container_of(data,packed_work,the_work));   
 
 }
@@ -565,8 +562,12 @@ int init_module(void) {
      
       for(j = 0; j < 2; j++) {
       
-         mutex_init(& (objects[i].operation_synchronizer[j]));
+         mutex_init(& (objects[i].data_access[j]));
+         mutex_init(& (objects[i].next_to_access[j]));
+         mutex_init(& (objects[i].first_access[j]));
+
          objects[i].valid_bytes[j] = 0;
+         objects[i].reserved_bytes[j] = 0;
          objects[i].stream_content[j] = NULL;
          objects[i].stream_content[j] = (char*)__get_free_page(GFP_KERNEL);
          if(objects[i].stream_content[j] == NULL) goto revert_allocation;
