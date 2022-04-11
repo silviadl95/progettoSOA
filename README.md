@@ -36,6 +36,4 @@ Una volta svegliati controlleranno lo stato del file device per vedere se è pos
 Una volta letto/scritto i thread chiamano la funzione awake per svegliare un thread in attesa nella waitqueue.
 
 Per le scritture asincrone di bassa priorità:
-Se la scrittura è asincrona il thread crea un task che seguirà una write deferred.
-Considerando che il thread che ha eseguito la scrittura deve ricevere la risposta in modo sincrono dopo aver schedulato il task si posiziona nella wait queue in attesa della risposta del task.
-Il task dopo aver eseguito la deferred write chiama la funzione awake e modifica un certo parametro per segnalare quanti byte ha scritto.
+Se la scrittura è asincrona il thread riserva i byte necessari per la scrittura, non effettua immediatamente la scrittura ma crea un task che seguirà una write deferred.
